@@ -87,24 +87,26 @@ fn create_persistor(settings: &config::Settings) -> Box<dyn PersistExector> {
 
 // match engine is single-threaded. So `Controller` is used as the only entrance
 // for get and set the global state
+// Controller 是匹配引擎的主要控制器,作为获取和设置全局状态的唯一入口
+// 匹配引擎是单线程的
 pub struct Controller {
     //<LogHandlerType> where LogHandlerType: OperationLogConsumer + Send {
-    pub settings: config::Settings,
-    pub sequencer: Sequencer,
-    pub user_manager: UserManager,
-    pub balance_manager: BalanceManager,
-    pub eth_guard: EthLogGuard,
+    pub settings: config::Settings,      // 配置信息
+    pub sequencer: Sequencer,            // 序列生成器
+    pub user_manager: UserManager,       // 用户管理器
+    pub balance_manager: BalanceManager, // 余额管理器
+    pub eth_guard: EthLogGuard,          // ETH日志守卫
     //    pub asset_manager: AssetManager,
-    pub update_controller: BalanceUpdateController,
-    pub markets: HashMap<MarketName, market::Market>,
-    pub asset_market_names: HashMap<(BaseAsset, QuoteAsset), MarketName>,
+    pub update_controller: BalanceUpdateController,                       // 余额更新控制器
+    pub markets: HashMap<MarketName, market::Market>,                     // 市场映射表
+    pub asset_market_names: HashMap<(BaseAsset, QuoteAsset), MarketName>, // 资产市场名称映射
     // TODO: is it worth to use generics rather than dynamic pointer?
-    pub log_handler: Box<dyn OperationLogConsumer + Send + Sync>,
-    pub persistor: Box<dyn PersistExector>,
+    pub log_handler: Box<dyn OperationLogConsumer + Send + Sync>, // 操作日志处理器
+    pub persistor: Box<dyn PersistExector>,                       // 持久化执行器
     // TODO: is this needed?
-    pub dummy_persistor: Box<dyn PersistExector>,
-    db_pool: sqlx::Pool<DbType>,
-    market_load_cfg: MarketConfigs,
+    pub dummy_persistor: Box<dyn PersistExector>, // 空持久化执行器(用于测试)
+    db_pool: sqlx::Pool<DbType>,                  // 数据库连接池
+    market_load_cfg: MarketConfigs,               // 市场加载配置
 }
 
 const ORDER_LIST_MAX_LEN: usize = 100;
@@ -158,7 +160,7 @@ pub fn create_controller(cfgs: (config::Settings, MarketConfigs)) -> Controller 
         market_load_cfg: cfgs.1,
     }
 }
-
+// 主要功能实现
 impl Controller {
     //fn get_persistor(&mut self, real: bool) -> &mut Box<dyn PersistExector> {
     //if real {&mut self.persistor} else { &mut self.dummy_persistor }
@@ -166,25 +168,31 @@ impl Controller {
     //fn get_persistor(&mut self, real: bool) -> Box<dyn PersistExector> {
     //    if real {self.persistor} else { self.dummy_persistor }
     //}
+    // 获取资产列表
     pub fn asset_list(&self, _req: AssetListRequest) -> Result<AssetListResponse, Status> {
+        // 创建响应结果
         let result = AssetListResponse {
+            // 遍历配置中的资产列表并转换为AssetInfo结构
             asset_lists: self
                 .settings
                 .assets
                 .iter()
                 .map(|item| asset_list_response::AssetInfo {
-                    symbol: item.symbol.clone(),
-                    name: item.name.clone(),
-                    chain_id: item.chain_id as i32,
-                    token_address: item.token_address.clone(),
-                    precision: item.prec_show,
-                    logo_uri: item.logo_uri.clone(),
-                    inner_id: item.rollup_token_id,
+                    symbol: item.symbol.clone(),               // 资产符号
+                    name: item.name.clone(),                   // 资产名称
+                    chain_id: item.chain_id as i32,            // 链ID
+                    token_address: item.token_address.clone(), // 代币合约地址
+                    precision: item.prec_show,                 // 精度
+                    logo_uri: item.logo_uri.clone(),           // logo图片URI
+                    inner_id: item.rollup_token_id,            // 内部Token ID
                 })
-                .collect(),
+                .collect(), // 收集转换结果到vector
         };
+
+        // 返回成功响应
         Ok(result)
     }
+    // 获取余额
     pub fn balance_query(&self, req: BalanceQueryRequest) -> Result<BalanceQueryResponse, Status> {
         let all_asset_param_valid = req
             .assets
@@ -216,6 +224,7 @@ impl Controller {
             .collect();
         Ok(BalanceQueryResponse { balances })
     }
+    // 获取订单
     pub fn order_query(&self, req: OrderQueryRequest) -> Result<OrderQueryResponse, Status> {
         if req.market != "all" && !self.markets.contains_key(&req.market) {
             return Err(Status::invalid_argument("invalid market"));
@@ -264,6 +273,7 @@ impl Controller {
         };
         Ok(result)
     }
+    // 获取订单深度
     pub fn order_book_depth(&self, req: OrderBookDepthRequest) -> Result<OrderBookDepthResponse, Status> {
         // TODO cache
         let market = self
@@ -302,7 +312,7 @@ impl Controller {
             .ok_or_else(|| Status::invalid_argument("invalid order_id"))?;
         Ok(OrderInfo::from(order))
     }
-
+    // 获取市场列表
     pub fn market_list(&self, _req: MarketListRequest) -> Result<MarketListResponse, Status> {
         let markets = self
             .markets
@@ -320,6 +330,7 @@ impl Controller {
         Ok(MarketListResponse { markets })
     }
 
+    // 获取市场摘要
     pub fn market_summary(&self, req: MarketSummaryRequest) -> Result<MarketSummaryResponse, Status> {
         let markets: Vec<String> = if req.markets.is_empty() {
             self.markets.keys().cloned().collect()
@@ -348,6 +359,7 @@ impl Controller {
         Ok(MarketSummaryResponse { market_summaries })
     }
 
+    // 检查服务是否可用
     fn check_service_available(&self) -> bool {
         if self.log_handler.is_block() {
             log::warn!("log_handler full");
@@ -355,7 +367,7 @@ impl Controller {
         }
         self.persistor.service_available()
     }
-
+    // 注册用户
     pub fn register_user(&mut self, real: bool, mut req: UserInfo) -> std::result::Result<UserInfo, Status> {
         if !self.check_service_available() {
             return Err(Status::unavailable(""));
@@ -409,6 +421,7 @@ impl Controller {
         })
     }
 
+    // 更新余额
     pub fn update_balance(&mut self, real: bool, req: BalanceUpdateRequest) -> std::result::Result<BalanceUpdateResponse, Status> {
         if !self.check_service_available() {
             return Err(Status::unavailable(""));
@@ -474,6 +487,7 @@ impl Controller {
         Ok(BalanceUpdateResponse::default())
     }
 
+    // 下单
     pub fn order_put(&mut self, real: bool, req: OrderPutRequest) -> Result<OrderInfo, Status> {
         if !self.check_service_available() {
             return Err(Status::unavailable(""));
@@ -484,7 +498,7 @@ impl Controller {
         }
         Ok(OrderInfo::from(order))
     }
-
+    // 批量下单
     pub fn batch_order_put(&mut self, real: bool, req: BatchOrderPutRequest) -> Result<BatchOrderPutResponse, Status> {
         if !self.check_service_available() {
             return Err(Status::unavailable(""));
@@ -531,6 +545,7 @@ impl Controller {
         })
     }
 
+    // 取消订单
     pub fn order_cancel(&mut self, real: bool, req: OrderCancelRequest) -> Result<OrderInfo, tonic::Status> {
         if !self.check_service_available() {
             return Err(Status::unavailable(""));
@@ -555,6 +570,7 @@ impl Controller {
         Ok(OrderInfo::from(order))
     }
 
+    // 取消所有订单
     pub fn order_cancel_all(&mut self, real: bool, req: OrderCancelAllRequest) -> Result<OrderCancelAllResponse, tonic::Status> {
         if !self.check_service_available() {
             return Err(Status::unavailable(""));
@@ -572,6 +588,7 @@ impl Controller {
         Ok(OrderCancelAllResponse { total })
     }
 
+    // 调试信息转储
     pub async fn debug_dump(&self, _req: DebugDumpRequest) -> Result<DebugDumpResponse, Status> {
         async {
             let mut connection = ConnectionType::connect(&self.settings.db_log).await?;
@@ -594,6 +611,7 @@ impl Controller {
         //Ok(())
     }
 
+    // 市场加载
     pub async fn market_reload(&mut self, from_scratch: bool) -> Result<(), Status> {
         if from_scratch {
             self.market_load_cfg.reset_load_time();
@@ -633,6 +651,7 @@ impl Controller {
         Ok(())
     }
 
+    // 转账
     pub fn transfer(&mut self, real: bool, req: TransferRequest) -> Result<TransferResponse, Status> {
         if !self.check_service_available() {
             return Err(Status::unavailable(""));
@@ -740,6 +759,7 @@ impl Controller {
         })
     }
 
+    // 调试重置
     pub async fn debug_reset(&mut self, _req: DebugResetRequest) -> Result<DebugResetResponse, Status> {
         async {
             log::info!("do full reset: memory and db");
@@ -820,6 +840,7 @@ impl Controller {
     }
 
     // reload 1000 in batch and replay
+    // 重放操作
     pub fn replay(&mut self, method: &str, params: &str) -> SimpleResult {
         match method {
             OPERATION_BALANCE_UPDATE => {
@@ -847,6 +868,7 @@ impl Controller {
         }
         Ok(())
     }
+    // 下单
     fn put_order(&mut self, real: bool, req: &OrderPutRequest) -> Result<Order, Status> {
         if !self.markets.contains_key(&req.market) {
             return Err(Status::invalid_argument("invalid market"));
@@ -875,6 +897,7 @@ impl Controller {
             )
             .map_err(|e| Status::unknown(format!("{}", e)))
     }
+    // 追加操作日志
     fn append_operation_log<Operation>(&mut self, method: &str, req: &Operation)
     where
         Operation: Serialize,
