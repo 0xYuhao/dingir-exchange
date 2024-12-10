@@ -194,6 +194,7 @@ impl Controller {
     }
     // 获取余额
     pub fn balance_query(&self, req: BalanceQueryRequest) -> Result<BalanceQueryResponse, Status> {
+        // 1. 验证请求中的资产是否有效
         let all_asset_param_valid = req
             .assets
             .iter()
@@ -201,20 +202,29 @@ impl Controller {
         if !all_asset_param_valid {
             return Err(Status::invalid_argument("invalid asset"));
         }
+
+        // 2. 确定要查询的资产列表
         let query_assets = if req.assets.is_empty() {
+            // 如果请求中没有指定资产,则查询所有资产
             self.settings.assets.iter().map(|asset| asset.id.clone()).collect()
         } else {
+            // 否则使用请求中指定的资产列表
             req.assets
         };
+
+        // 3. 获取用户余额信息
         let user_id = req.user_id;
         let balance_manager = &self.balance_manager;
         let balances = query_assets
             .into_iter()
             .map(|asset_id| {
+                // 获取可用余额和冻结余额
                 let available = balance_manager
                     .get_with_round(user_id, BalanceType::AVAILABLE, &asset_id)
                     .to_string();
                 let frozen = balance_manager.get_with_round(user_id, BalanceType::FREEZE, &asset_id).to_string();
+
+                // 构造资产余额响应
                 balance_query_response::AssetBalance {
                     asset_id,
                     available,
@@ -222,6 +232,8 @@ impl Controller {
                 }
             })
             .collect();
+
+        // 4. 返回余额查询响应
         Ok(BalanceQueryResponse { balances })
     }
     // 获取订单
