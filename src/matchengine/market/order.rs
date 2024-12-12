@@ -7,23 +7,29 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
+// 卖单(Ask)的排序 - 通过derive自动实现
+// (价格从低到高排序)
 pub struct MarketKeyAsk {
-    pub order_price: Decimal,
-    pub order_id: u64,
+    pub order_price: Decimal, // 价格作为第一排序键
+    pub order_id: u64,        // 价格相同的情况下，订单ID作为第二排序键
 }
 
 #[derive(PartialEq, Eq)]
+// 买单(Bid)的排序 - 手动实现
+// (价格从高到低排序)
 pub struct MarketKeyBid {
     pub order_price: Decimal,
     pub order_id: u64,
 }
-
+// 为买单手动实现排序,实现价格从高到低排序
 impl Ord for MarketKeyBid {
     fn cmp(&self, other: &Self) -> Ordering {
+        // reverse()使得价格比较结果反转,实现从高到低排序
         let price_order = self.order_price.cmp(&other.order_price).reverse();
         if price_order != Ordering::Equal {
             price_order
         } else {
+            // 当价格相同时,按order_id排序
             self.order_id.cmp(&other.order_id)
         }
     }
@@ -145,18 +151,22 @@ pub struct OrderRc(Arc<RwLock<Order>>);
     casted from ARc rather than RwLock here if we do not care about unsafe
 */
 impl OrderRc {
+    // 创建一个新的OrderRc
     pub(super) fn new(order: Order) -> Self {
         OrderRc(Arc::new(RwLock::new(order)))
     }
 
+    // 获取OrderRc的读锁
     pub fn borrow(&self) -> RwLockReadGuard<'_, Order> {
         self.0.try_read().expect("Lock for parent entry ensure it")
     }
 
+    // 获取OrderRc的写锁
     pub(super) fn borrow_mut(&mut self) -> RwLockWriteGuard<'_, Order> {
         self.0.try_write().expect("Lock for parent entry ensure it")
     }
 
+    // 获取OrderRc的Order副本
     pub fn deep(&self) -> Order {
         *self.borrow()
     }

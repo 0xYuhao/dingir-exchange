@@ -43,6 +43,7 @@ pub struct Market {
     //     pub order_id: u64,
     // }
     pub asks: BTreeMap<MarketKeyAsk, OrderRc>, // 卖单队列
+    //
     pub bids: BTreeMap<MarketKeyBid, OrderRc>, // 买单队列
 
     pub trade_count: u64, // 成交数量
@@ -370,6 +371,7 @@ impl Market {
         persistor.put_order(&taker, OrderEventType::PUT);
 
         // 设置订单类型标志
+        // taker是用户的订单,maker是对手方的订单
         let taker_is_ask = taker.side == OrderSide::ASK; // taker是否为卖单
         let taker_is_bid = !taker_is_ask; // taker是否为买单
         let maker_is_bid = taker_is_ask; // maker是否为买单
@@ -396,7 +398,7 @@ impl Market {
         for maker_ref in counter_orders {
             // Step1: get ask and bid
             // 步骤1: 获取买卖双方订单
-            let mut maker = maker_ref.borrow_mut();
+            let mut maker = maker_ref.borrow_mut(); // borrow_mut 获取对手方订单的写锁
             if taker.remain.is_zero() {
                 break; // taker已完全成交,退出循环
             }
