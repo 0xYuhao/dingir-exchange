@@ -426,14 +426,17 @@ impl Market {
 
             // Step2: abort if needed
             // 如果taker是限价单且maker的卖价高于taker的买价,则无法成交
+            // 因为卖单队列的价格是从低到高排序，如果当前maker的卖价高于taker的买价,则无法成交,可以直接中断循环
             if is_limit_order && ask_order.price.gt(&bid_order.price) {
                 break; // 限价单且卖价高于买价,无法成交
             }
             // new trade will be generated
+            // 如果taker是只挂单订单且遇到可成交订单,需要取消taker订单
             if is_post_only_order {
                 need_cancel = true; // 只挂单订单遇到可成交订单需要取消
                 break;
             }
+            // 如果taker和maker是同一个用户,且禁止自成交,需要取消taker订单
             if ask_order.user == bid_order.user && self.disable_self_trade {
                 need_cancel = true; // 自成交且禁止自成交,需要取消
                 break;
@@ -444,6 +447,7 @@ impl Market {
             let mut traded_base_amount = min(ask_order.remain, bid_order.remain);
             // 市价买单需要检查报价限制
             if taker_is_bid && is_market_order {
+                // 检查当前成交金额是否会超出报价限制 （quote_sum 当前已占用的报价金额，市价单专属，初始为0）
                 if (quote_sum + price * traded_base_amount).gt(quote_limit) {
                     // divide remain quote by price to get a base amount to be traded,
                     // so quote_limit will be `almost` fulfilled
@@ -467,8 +471,10 @@ impl Market {
 
             // Step4: create the trade
             // 步骤4: 创建成交记录
-            let bid_fee = (traded_base_amount * bid_fee_rate).round_dp_with_strategy(self.base_prec, RoundingStrategy::ToZero); // 计算买方手续费
-            let ask_fee = (traded_quote_amount * ask_fee_rate).round_dp_with_strategy(self.quote_prec, RoundingStrategy::ToZero); // 计算卖方手续
+            // 计算买方手续费是 成交数量 * 买方手续费率  （成交数量是基础货币数量）
+            let bid_fee = (traded_base_amount * bid_fee_rate).round_dp_with_strategy(self.base_prec, RoundingStrategy::ToZero);
+            // 计算卖方手续费是 成交金额 * 卖方手续费率  （成交金额是报价货币数量）
+            let ask_fee = (traded_quote_amount * ask_fee_rate).round_dp_with_strategy(self.quote_prec, RoundingStrategy::ToZero);
 
             // 更新订单时间戳
             let timestamp = current_timestamp();
@@ -479,29 +485,46 @@ impl Market {
             let trade_id = sequencer.next_trade_id();
             // 创建成交记录
             let trade = Trade {
-                id: trade_id,
-                timestamp: current_timestamp(),
-                market: self.name.to_string(),
-                base: self.base.into(),
-                quote: self.quote.into(),
-                price,
-                amount: traded_base_amount,
-                quote_amount: traded_quote_amount,
-                ask_user_id: ask_order.user,
-                ask_order_id: ask_order.id,
-                ask_role: if taker_is_ask { MarketRole::TAKER } else { MarketRole::MAKER },
-                ask_fee,
-                bid_user_id: bid_order.user,
-                bid_order_id: bid_order.id,
-                bid_role: if taker_is_ask { MarketRole::MAKER } else { MarketRole::TAKER },
-                bid_fee,
+                id: trade_id,                      // 交易ID,由序列生成器生成
+                timestamp: current_timestamp(),    // 交易发生的时间戳
+                market: self.name.to_string(),     // 交易市场名称
+                base: self.base.into(),            // 基础货币
+                quote: self.quote.into(),          // 报价货币
+                price,                             // 成交价格
+                amount: traded_base_amount,        // 成交数量(基础货币)
+                quote_amount: traded_quote_amount, // 成交金额(报价货币)
 
-                ask_order: None,
-                bid_order: None,
+                // 卖方信息
+                ask_user_id: ask_order.user, // 卖方用户ID
+                ask_order_id: ask_order.id,  // 卖方订单ID
+                ask_role: if taker_is_ask {
+                    // 用户单角色(Taker/Maker)
+                    MarketRole::TAKER
+                } else {
+                    MarketRole::MAKER
+                },
+                ask_fee, // 卖方手续费
+
+                // 买方信息
+                bid_user_id: bid_order.user, // 买方用户ID
+                bid_order_id: bid_order.id,  // 买方订单ID
+                bid_role: if taker_is_ask {
+                    // 对手单角色(Taker/Maker)
+                    MarketRole::MAKER
+                } else {
+                    MarketRole::TAKER
+                },
+                bid_fee, // 买方手续费
+
+                // 可选字段
+                ask_order: None, // 卖方订单完整信息(可选)
+                bid_order: None, // 买方订单完整信息(可选)
+
+                // 仅在启用 emit_state_diff 特性时包含
                 #[cfg(feature = "emit_state_diff")]
-                state_before: Default::default(),
+                state_before: Default::default(), // 交易前状态
                 #[cfg(feature = "emit_state_diff")]
-                state_after: Default::default(),
+                state_after: Default::default(), // 交易后状态
             };
             #[cfg(feature = "emit_state_diff")]
             let state_before = Self::get_trade_state(ask_order, bid_order, balance_manager, self.base, self.quote);
