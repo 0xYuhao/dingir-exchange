@@ -23,29 +23,33 @@ pub use order::*;
 mod trade;
 pub use trade::*;
 
+// Market - 表示一个交易市场
 pub struct Market {
-    pub name: &'static str,
-    pub base: &'static str,
-    pub quote: &'static str,
-    pub amount_prec: u32,
-    pub price_prec: u32,
-    pub base_prec: u32,
-    pub quote_prec: u32,
-    pub fee_prec: u32,
-    pub min_amount: Decimal,
-    pub price: Decimal,
+    pub name: &'static str,  // 市场名称
+    pub base: &'static str,  // 基础货币
+    pub quote: &'static str, // 报价货币
+    pub amount_prec: u32,    // 数量精度
+    pub price_prec: u32,     // 价格精度
+    pub base_prec: u32,      // 基础货币精度
+    pub quote_prec: u32,     // 报价货币精度
+    pub fee_prec: u32,       // 手续费精度
+    pub min_amount: Decimal, // 最小交易数量
+    pub price: Decimal,      // 当前价格
 
-    pub orders: BTreeMap<u64, OrderRc>,
-    pub users: BTreeMap<u32, BTreeMap<u64, OrderRc>>,
+    pub orders: BTreeMap<u64, OrderRc>,               // 所有订单
+    pub users: BTreeMap<u32, BTreeMap<u64, OrderRc>>, // 用户订单映射
+    //pub struct MarketKeyAsk {
+    //     pub order_price: Decimal,
+    //     pub order_id: u64,
+    // }
+    pub asks: BTreeMap<MarketKeyAsk, OrderRc>, // 卖单队列
+    pub bids: BTreeMap<MarketKeyBid, OrderRc>, // 买单队列
 
-    pub asks: BTreeMap<MarketKeyAsk, OrderRc>,
-    pub bids: BTreeMap<MarketKeyBid, OrderRc>,
+    pub trade_count: u64, // 成交数量
 
-    pub trade_count: u64,
-
-    pub disable_self_trade: bool,
-    pub disable_market_order: bool,
-    pub check_eddsa_signatue: OrderSignatrueCheck,
+    pub disable_self_trade: bool,                  // 是否禁止自成交
+    pub disable_market_order: bool,                // 是否禁止市价单
+    pub check_eddsa_signatue: OrderSignatrueCheck, // 签名验证设置
 }
 
 pub struct BalanceManagerWrapper<'a> {
@@ -87,18 +91,35 @@ const MAP_INIT_CAPACITY: usize = 1024;
 // TODO: is it ok to match with oneself's order?
 // TODO: precision
 impl Market {
+    // 创建新市场
     pub fn new(market_conf: &config::Market, global_settings: &config::Settings, balance_manager: &BalanceManager) -> Result<Market> {
+        // 定义两个闭包函数用于检查资产
+        // 检查资产是否存在
         let asset_exist = |asset: &str| -> bool { balance_manager.asset_manager.asset_exist(asset) };
+        // 获取资产精度
         let asset_prec = |asset: &str| -> u32 { balance_manager.asset_manager.asset_prec(asset) };
+
+        // 检查交易对中的基础货币和报价货币是否存在
         if !asset_exist(&market_conf.quote) || !asset_exist(&market_conf.base) {
             bail!("invalid assert id {} {}", market_conf.quote, market_conf.base);
         }
+
+        // 获取基础货币和报价货币的精度
         let base_prec = asset_prec(&market_conf.base);
         let quote_prec = asset_prec(&market_conf.quote);
+
+        // 验证交易精度设置是否合理:
+        // 1. 数量精度不能大于基础货币精度
+        // 2. 数量精度+价格精度不能大于报价货币精度
         if market_conf.amount_prec > base_prec || market_conf.amount_prec + market_conf.price_prec > quote_prec {
             bail!("invalid precision");
         }
+
+        // 是否允许手续费精度取整
         let allow_rounding_fee = true;
+        // 如果不允许手续费精度取整,则需要验证:
+        // 1. 数量精度+手续费精度不能大于基础货币精度
+        // 2. 数量精度+价格精度+手续费精度不能大于报价货币精度
         if !allow_rounding_fee {
             if market_conf.amount_prec + market_conf.fee_prec > base_prec
                 || market_conf.amount_prec + market_conf.price_prec + market_conf.fee_prec > quote_prec
@@ -106,6 +127,8 @@ impl Market {
                 bail!("invalid fee precision");
             }
         }
+
+        // 将字符串转换为'static生命周期的字符串引用
         let leak_fn = |x: &str| -> &'static str { Box::leak(x.to_string().into_boxed_str()) };
         let market = Market {
             name: leak_fn(&market_conf.name),
@@ -130,6 +153,7 @@ impl Market {
         Ok(market)
     }
 
+    // 重置市场状态
     pub fn reset(&mut self) {
         log::debug!("market {} reset", self.name);
         self.bids.clear();
@@ -137,11 +161,13 @@ impl Market {
         self.users.clear();
         self.orders.clear();
     }
+    // 冻结用户余额
     pub fn frozen_balance(&self, balance_manager: &mut BalanceManagerWrapper<'_>, order: &Order) {
         let asset = if order.is_ask() { &self.base } else { &self.quote };
 
         balance_manager.balance_frozen(order.user, asset, &order.frozen);
     }
+    // 解冻用户余额
     pub fn unfrozen_balance(&self, balance_manager: &mut BalanceManagerWrapper<'_>, order: &Order) {
         debug_assert!(order.remain.is_sign_positive());
         if order.remain.is_zero() {
@@ -151,49 +177,67 @@ impl Market {
         balance_manager.balance_unfrozen(order.user, asset, &order.frozen);
     }
 
+    // 处理订单的主要函数
     pub fn put_order(
         &mut self,
-        sequencer: &mut Sequencer,
-        mut balance_manager: BalanceManagerWrapper<'_>,
-        balance_update_controller: &mut BalanceUpdateController,
-        persistor: &mut impl PersistExector,
-        order_input: OrderInput,
+        sequencer: &mut Sequencer,                               // 序列生成器,用于生成订单ID
+        mut balance_manager: BalanceManagerWrapper<'_>,          // 余额管理器
+        balance_update_controller: &mut BalanceUpdateController, // 余额更新控制器
+        persistor: &mut impl PersistExector,                     // 持久化执行器
+        order_input: OrderInput,                                 // 输入的订单信息
     ) -> Result<Order> {
+        // 1. 订单基本验证
+        // 检查是否允许市价单
         if order_input.type_ == OrderType::MARKET && self.disable_market_order {
             bail!("market orders disabled");
         }
+        // 检查订单数量是否达到最小要求
         if order_input.amount.lt(&self.min_amount) {
             bail!("invalid amount");
         }
         // fee_prec == 0 means no fee allowed
+        // 如果手续费精度为0，则不允许设置手续费
         if self.fee_prec == 0 && (!order_input.taker_fee.is_zero() || !order_input.maker_fee.is_zero()) {
             bail!("only 0 fee is supported now");
         }
+
+        // 2. 精度处理
+        // 处理数量精度 （防御性编程，这是要求输入的值已经是正确的精度了）
         let amount = order_input
             .amount
             .round_dp_with_strategy(self.amount_prec, RoundingStrategy::ToZero);
+        //（防御性编程，这是要求输入的值已经是正确的精度了）
         if amount != order_input.amount {
             bail!("invalid amount precision");
         }
+        // 处理价格精度
         let price = order_input.price.round_dp(self.price_prec);
         if price != order_input.price {
             bail!("invalid price precision");
         }
+
+        // 3. 市价单特殊验证
         if order_input.type_ == OrderType::MARKET {
+            // 市价单不能设置价格
             if !order_input.price.is_zero() {
                 bail!("market order should not have a price");
             }
+            // 市价单不能设置post_only（市价单不能设置为仅作为挂单）
             if order_input.post_only {
                 bail!("market order cannot be post only");
             }
+            // 市价单必须有对手单
             if order_input.side == OrderSide::ASK && self.bids.is_empty() || order_input.side == OrderSide::BID && self.asks.is_empty() {
                 bail!("no counter orders");
             }
         } else if order_input.price.is_zero() {
+            // 限价单必须设置价格
             bail!("invalid price for limit order");
         }
 
+        // 4. 余额检查
         if order_input.side == OrderSide::ASK {
+            // 卖单检查base资产余额
             if balance_manager
                 .balance_get(order_input.user_id, BalanceType::AVAILABLE, self.base)
                 .lt(&order_input.amount)
@@ -201,9 +245,11 @@ impl Market {
                 bail!("balance not enough");
             }
         } else {
+            // 买单检查quote资产余额
             let balance = balance_manager.balance_get(order_input.user_id, BalanceType::AVAILABLE, self.quote);
 
             if order_input.type_ == OrderType::LIMIT {
+                // 限价买单需要检查 数量*价格 是否超过余额
                 if balance.lt(&(order_input.amount * order_input.price)) {
                     bail!(
                         "balance not enough: balance({}) < amount({}) * price({})",
@@ -225,14 +271,33 @@ impl Market {
                 //if balance.lt(&(order_input.amount * top_counter_order_price)) {
                 //    bail!("balance not enough");
                 //}
+
+                // 我们已经检查了对手订单簿不为空,
+                // 所以这里的 `unwrap` 是安全的。
+                // 这里我们只对订单簿顶部的对手单做最小余额检查。
+                // 在检查之后,余额可能仍然不足,那么订单的剩余部分
+                // 将被标记为 `canceled(finished)`。
+
+                // 更新于 2021.06.22: 我们现在允许市价单部分成交一个对手单
+                // 所以我们现在不需要这个检查了
+                //let top_counter_order_price = self.asks.values().next().unwrap().borrow().price;
+                //if balance.lt(&(order_input.amount * top_counter_order_price)) {
+                //    bail!("balance not enough");
+                //}
             }
+            // 市价买单的余额检查已被移除,允许部分成交
         }
+
+        // 5. 设置quote限制(仅用于市价买单)
         let quote_limit = if order_input.type_ == OrderType::MARKET && order_input.side == OrderSide::BID {
             let balance = balance_manager.balance_get(order_input.user_id, BalanceType::AVAILABLE, self.quote);
             if order_input.quote_limit.is_zero() {
                 // quote_limit == 0 means no extra limit
+                // 如果quote_limit为0，则直接使用余额作为quote限制
+                // quote_limit为0表示无额外限制
                 balance
             } else {
+                // 取余额和quote_limit的较小值
                 std::cmp::min(
                     balance,
                     order_input
@@ -245,29 +310,32 @@ impl Market {
             Decimal::zero()
         };
 
+        // 6. 创建订单对象
         let t = current_timestamp();
         let order = Order {
             id: sequencer.next_order_id(),
-            type_: order_input.type_,
-            side: order_input.side,
-            create_time: t,
-            update_time: t,
-            market: self.name.into(),
-            base: self.base.into(),
-            quote: self.quote.into(),
-            user: order_input.user_id,
-            price: order_input.price,
-            amount: order_input.amount,
-            taker_fee: order_input.taker_fee,
-            maker_fee: order_input.maker_fee,
-            remain: order_input.amount,
-            frozen: Decimal::zero(),
-            finished_base: Decimal::zero(),
-            finished_quote: Decimal::zero(),
-            finished_fee: Decimal::zero(),
-            post_only: order_input.post_only,
-            signature: order_input.signature,
+            type_: order_input.type_,         // 订单类型(市价单/限价单)
+            side: order_input.side,           // 订单方向(买/卖)
+            create_time: t,                   // 创建时间
+            update_time: t,                   // 更新时间
+            market: self.name.into(),         // 市场名称
+            base: self.base.into(),           // 基础货币
+            quote: self.quote.into(),         // 报价货币
+            user: order_input.user_id,        // 用户ID
+            price: order_input.price,         // 价格
+            amount: order_input.amount,       // 数量
+            taker_fee: order_input.taker_fee, // taker手续费率
+            maker_fee: order_input.maker_fee, // maker手续费率
+            remain: order_input.amount,       // 剩余未成交数量
+            frozen: Decimal::zero(),          // 冻结金额
+            finished_base: Decimal::zero(),   // 已成交基础货币数量
+            finished_quote: Decimal::zero(),  // 已成交报价货币数量
+            finished_fee: Decimal::zero(),    // 已成交手续费
+            post_only: order_input.post_only, // 是否仅做挂单(post_only)
+            signature: order_input.signature, // 签名
         };
+
+        // 7. 执行订单撮合
         let order = self.execute_order(
             sequencer,
             &mut balance_manager,
@@ -282,6 +350,7 @@ impl Market {
     // the last parameter `quote_limit`, is only used for market bid order,
     // it indicates the `quote` balance of the user,
     // so the sum of all the trades' quote amount cannot exceed this value
+    // 执行订单撮合
     fn execute_order(
         &mut self,
         sequencer: &mut Sequencer,
@@ -297,41 +366,51 @@ impl Market {
         // so if an order is matched instantly, only 'FINISH' event will occur, no 'PUT' event
         // now PUT means being created
         // we can revisit this decision later
+        // 记录订单创建事件
         persistor.put_order(&taker, OrderEventType::PUT);
 
-        let taker_is_ask = taker.side == OrderSide::ASK;
-        let taker_is_bid = !taker_is_ask;
-        let maker_is_bid = taker_is_ask;
-        let maker_is_ask = !maker_is_bid;
-        let is_limit_order = taker.type_ == OrderType::LIMIT;
-        let is_market_order = !is_limit_order;
-        let is_post_only_order = taker.post_only;
+        // 设置订单类型标志
+        let taker_is_ask = taker.side == OrderSide::ASK; // taker是否为卖单
+        let taker_is_bid = !taker_is_ask; // taker是否为买单
+        let maker_is_bid = taker_is_ask; // maker是否为买单
+        let maker_is_ask = !maker_is_bid; // maker是否为卖单
+        let is_limit_order = taker.type_ == OrderType::LIMIT; // 是否为限价单
+        let is_market_order = !is_limit_order; // 是否为市价单
+        let is_post_only_order = taker.post_only; // 是否为只挂单订单
 
-        let mut quote_sum = Decimal::zero();
+        let mut quote_sum = Decimal::zero(); // 累计成交的报价金额
+        let mut finished_orders = Vec::new(); // 已完成订单列表
 
-        let mut finished_orders = Vec::new();
-
+        // 获取对手方订单列表迭代器
         let counter_orders: Box<dyn Iterator<Item = &mut OrderRc>> = if maker_is_bid {
-            Box::new(self.bids.values_mut())
+            Box::new(self.bids.values_mut()) // 如果maker是买单,获取买单列表
         } else {
-            Box::new(self.asks.values_mut())
+            Box::new(self.asks.values_mut()) // 如果maker是卖单,获取卖单列表
         };
 
         // TODO: find a more elegant way to handle this
+        // 是否需要取消订单的标志
         let mut need_cancel = false;
+
+        // 遍历对手方订单进行撮合
         for maker_ref in counter_orders {
             // Step1: get ask and bid
+            // 步骤1: 获取买卖双方订单
             let mut maker = maker_ref.borrow_mut();
             if taker.remain.is_zero() {
-                break;
+                break; // taker已完全成交,退出循环
             }
+
+            // 获取买卖双方手续费率
             let (ask_fee_rate, bid_fee_rate) = if taker_is_ask {
                 (taker.taker_fee, maker.maker_fee)
             } else {
                 (maker.maker_fee, taker.taker_fee)
             };
             // of course, price should be counter order price
+            // 以maker的价格为成交价
             let price = maker.price;
+            // 确定买卖双方订单
             let (ask_order, bid_order) = if taker_is_ask {
                 (&mut taker, &mut *maker)
             } else {
@@ -341,25 +420,31 @@ impl Market {
             //let bid_order_id: u64 = bid_order.id;
 
             // Step2: abort if needed
+            // 如果taker是限价单且maker的卖价高于taker的买价,则无法成交
             if is_limit_order && ask_order.price.gt(&bid_order.price) {
-                break;
+                break; // 限价单且卖价高于买价,无法成交
             }
             // new trade will be generated
             if is_post_only_order {
-                need_cancel = true;
+                need_cancel = true; // 只挂单订单遇到可成交订单需要取消
                 break;
             }
             if ask_order.user == bid_order.user && self.disable_self_trade {
-                need_cancel = true;
+                need_cancel = true; // 自成交且禁止自成交,需要取消
                 break;
             }
 
             // Step3: get trade amount
+            // 计算成交数量
             let mut traded_base_amount = min(ask_order.remain, bid_order.remain);
+            // 市价买单需要检查报价限制
             if taker_is_bid && is_market_order {
                 if (quote_sum + price * traded_base_amount).gt(quote_limit) {
                     // divide remain quote by price to get a base amount to be traded,
                     // so quote_limit will be `almost` fulfilled
+                    // 将剩余报价除以价格,得到可成交的基础货币数量,
+                    // 这样报价限制将接近满足
+                    // 如果超出报价限制,按剩余报价限制计算可成交数量
                     let remain_quote_limit = quote_limit - quote_sum;
                     traded_base_amount = (remain_quote_limit / price).round_dp_with_strategy(self.amount_prec, RoundingStrategy::ToZero);
                     if traded_base_amount.is_zero() {
@@ -376,15 +461,18 @@ impl Market {
             }
 
             // Step4: create the trade
-            let bid_fee = (traded_base_amount * bid_fee_rate).round_dp_with_strategy(self.base_prec, RoundingStrategy::ToZero);
-            let ask_fee = (traded_quote_amount * ask_fee_rate).round_dp_with_strategy(self.quote_prec, RoundingStrategy::ToZero);
+            // 步骤4: 创建成交记录
+            let bid_fee = (traded_base_amount * bid_fee_rate).round_dp_with_strategy(self.base_prec, RoundingStrategy::ToZero); // 计算买方手续费
+            let ask_fee = (traded_quote_amount * ask_fee_rate).round_dp_with_strategy(self.quote_prec, RoundingStrategy::ToZero); // 计算卖方手续
 
+            // 更新订单时间戳
             let timestamp = current_timestamp();
             ask_order.update_time = timestamp;
             bid_order.update_time = timestamp;
 
             // emit the trade
             let trade_id = sequencer.next_trade_id();
+            // 创建成交记录
             let trade = Trade {
                 id: trade_id,
                 timestamp: current_timestamp(),
@@ -418,6 +506,7 @@ impl Market {
             }
 
             // Step5: update orders
+            // 更新订单状态
             let ask_order_is_new = ask_order.finished_base.is_zero();
             let ask_order_before = *ask_order;
             let bid_order_is_new = bid_order.finished_base.is_zero();
@@ -434,6 +523,7 @@ impl Market {
             bid_order.finished_fee += bid_fee;
 
             // Step6: update balances
+
             balance_update_controller
                 .update_user_balance(
                     balance_manager.inner,
@@ -541,6 +631,7 @@ impl Market {
             //}
             maker.frozen -= if maker_is_bid { traded_quote_amount } else { traded_base_amount };
 
+            // 检查maker是否完全成交
             let maker_finished = maker.remain.is_zero();
             if maker_finished {
                 finished_orders.push(*maker);
@@ -551,38 +642,47 @@ impl Market {
             }
 
             // Save this trade price to market.
+            // 更新市场最新价格
             self.price = price;
         }
 
+        // 处理已完成的订单
         for item in finished_orders.iter() {
             self.order_finish(&mut *balance_manager, persistor, item);
         }
 
+        // 处理taker订单的最终状态
         if need_cancel {
             // Now both self trade orders and immediately triggered post_only
             // limit orders will be cancelled here.
             // TODO: use CANCEL event here
+            // 需要取消的订单(自成交或post_only触发)
             persistor.put_order(&taker, OrderEventType::FINISH);
         } else if taker.type_ == OrderType::MARKET {
             // market order can either filled or not
             // if it is filled, `FINISH` is ok
             // if it is not filled, `CANCELED` may be a better choice?
+            // 市价单完成
             persistor.put_order(&taker, OrderEventType::FINISH);
         } else {
             // now the order type is limit
+            // 限价单处理
             if taker.remain.is_zero() {
+                // 完全成交
                 persistor.put_order(&taker, OrderEventType::FINISH);
             } else {
                 // `insert_order` will update the order info
+                // 部分成交或未成交,插入订单簿
                 taker = self.insert_order_into_orderbook(taker);
                 self.frozen_balance(balance_manager, &taker);
             }
         }
 
         log::debug!("execute_order done {:?}", taker);
-        taker
+        taker // 返回处理后的taker订单
     }
 
+    // 将订单插入订单簿
     pub fn insert_order_into_orderbook(&mut self, mut order: Order) -> Order {
         if order.side == OrderSide::ASK {
             order.frozen = order.remain;
@@ -610,6 +710,7 @@ impl Market {
         order_rc.deep()
     }
 
+    // 完成订单处理
     fn order_finish(&mut self, balance_manager: &mut BalanceManagerWrapper<'_>, persistor: &mut impl PersistExector, order: &Order) {
         if order.side == OrderSide::ASK {
             let key = &order.get_ask_key();
@@ -685,12 +786,14 @@ impl Market {
             ],
         }
     }
+    // 取消单个订单
     pub fn cancel(&mut self, mut balance_manager: BalanceManagerWrapper<'_>, persistor: &mut impl PersistExector, order_id: u64) -> Order {
         let order = self.orders.get(&order_id).unwrap();
         let order_struct = order.deep();
         self.order_finish(&mut balance_manager, persistor, &order_struct);
         order_struct
     }
+    // 取消用户所有订单
     pub fn cancel_all_for_user(
         &mut self,
         mut balance_manager: BalanceManagerWrapper<'_>,
@@ -707,6 +810,7 @@ impl Market {
         }
         total
     }
+    // 获取订单信息
     pub fn get(&self, order_id: u64) -> Option<Order> {
         self.orders.get(&order_id).map(OrderRc::deep)
     }
@@ -727,6 +831,7 @@ impl Market {
             log::info!("{}, {:?}", k, v.borrow())
         }
     }
+    // 获取市场状态
     pub fn status(&self) -> MarketStatus {
         MarketStatus {
             name: self.name.to_string(),
@@ -737,6 +842,7 @@ impl Market {
             trade_count: self.trade_count,
         }
     }
+    // 获取市场深度
     pub fn depth(&self, limit: usize, interval: &Decimal) -> MarketDepth {
         if interval.is_zero() {
             let id_fn = |order: &Order| -> Decimal { order.price };
