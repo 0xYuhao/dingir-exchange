@@ -42,9 +42,12 @@ pub struct Market {
     //     pub order_price: Decimal,
     //     pub order_id: u64,
     // }
-    pub asks: BTreeMap<MarketKeyAsk, OrderRc>, // 卖单队列
-    //
-    pub bids: BTreeMap<MarketKeyBid, OrderRc>, // 买单队列
+    pub asks: BTreeMap<MarketKeyAsk, OrderRc>, // 卖单队列 (价格从低到高排序)
+    //pub struct MarketKeyBid {
+    //     pub order_price: Decimal,
+    //     pub order_id: u64,
+    // }
+    pub bids: BTreeMap<MarketKeyBid, OrderRc>, // 买单队列 (价格从高到低排序)
 
     pub trade_count: u64, // 成交数量
 
