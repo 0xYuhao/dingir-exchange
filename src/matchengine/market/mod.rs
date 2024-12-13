@@ -535,10 +535,15 @@ impl Market {
 
             // Step5: update orders
             // 更新订单状态
+            // 检查ask_order是否是新订单
             let ask_order_is_new = ask_order.finished_base.is_zero();
-            let ask_order_before = *ask_order;
+            // 检查bid_order是否是新订单
             let bid_order_is_new = bid_order.finished_base.is_zero();
+            // 保存ask_order的原始状态
+            let ask_order_before = *ask_order;
+            // 保存bid_order的原始状态
             let bid_order_before = *bid_order;
+            // 更新ask_order的剩余数量
             ask_order.remain -= traded_base_amount;
             debug_assert!(ask_order.remain.is_sign_positive());
             bid_order.remain -= traded_base_amount;
@@ -551,7 +556,9 @@ impl Market {
             bid_order.finished_fee += bid_fee;
 
             // Step6: update balances
-
+            // 对于taker单，（用户主动发起的单子），不管买单还是卖单都用的是可用金额，但是作为对手单（maker单），如果是卖单，更新的是冻结金额，如果是买单更新的是可用金额。（也就是挂单的买单是不会冻结金额的）
+            // 也就是买单类型，更新的是可用余额，卖单类型，如果是对手单（maker）更新的是冻结余额，如果是用户单（taker）更新的是可用余额
+            // 更新买方基础资产余额 -- 更新的是可用余额 （加法）
             balance_update_controller
                 .update_user_balance(
                     balance_manager.inner,
@@ -565,15 +572,16 @@ impl Market {
                         business_id: trade_id,
                         market_price: self.price,
                         change: if bid_fee.is_sign_positive() {
-                            traded_base_amount - bid_fee
+                            traded_base_amount - bid_fee // 如果买单手续费为正,则减去手续费
                         } else {
-                            traded_base_amount
+                            traded_base_amount // 如果手续费为负,则不减去手续费
                         },
-                        detail: serde_json::Value::default(),
-                        signature: vec![],
+                        detail: serde_json::Value::default(), // 设置为 null 的详细信息字段,可用于记录额外的余额变动信息
+                        signature: vec![],                    // 设置为空的签名字段
                     },
                 )
                 .unwrap();
+            // 更新卖方基础资产余额 -- 如果卖方是对手单，更新的是冻结余额 （减法）
             balance_update_controller
                 .update_user_balance(
                     balance_manager.inner,
@@ -596,6 +604,7 @@ impl Market {
                     },
                 )
                 .unwrap();
+            // 更新卖方报价资产余额 -- 更新的是可用余额 （加法）
             balance_update_controller
                 .update_user_balance(
                     balance_manager.inner,
@@ -618,6 +627,7 @@ impl Market {
                     },
                 )
                 .unwrap();
+            // 更新买方报价资产余额 -- 如果买方是对手单，更新的是冻结余额 （减法）
             balance_update_controller
                 .update_user_balance(
                     balance_manager.inner,
@@ -712,51 +722,74 @@ impl Market {
 
     // 将订单插入订单簿
     pub fn insert_order_into_orderbook(&mut self, mut order: Order) -> Order {
+        // 计算需要冻结的金额
+        // 如果是卖单(ASK),冻结的是基础货币数量
+        // 如果是买单(BID),冻结的是报价货币数量(数量*价格)
         if order.side == OrderSide::ASK {
-            order.frozen = order.remain;
+            order.frozen = order.remain; // 卖单冻结剩余数量
         } else {
-            order.frozen = order.remain * order.price;
+            order.frozen = order.remain * order.price; // 买单冻结剩余成交金额 (剩余数量 * 价格)
         }
         debug_assert_eq!(order.type_, OrderType::LIMIT);
         debug_assert!(!self.orders.contains_key(&order.id));
         // log::debug!("order insert {}", &order.id);
         let order_rc = OrderRc::new(order);
+        // 将订单添加到全局订单映射中，borrow 是读锁 获取订单的引用
         let order = order_rc.borrow();
         self.orders.insert(order.id, order_rc.clone());
+
+        // 将订单添加到用户订单映射中
+        // 如果用户没有订单映射则创建新的
         let user_map = self.users.entry(order.user).or_insert_with(BTreeMap::new);
-        debug_assert!(!user_map.contains_key(&order.id));
+        debug_assert!(!user_map.contains_key(&order.id)); // 确保用户订单映射中不存在该订单
         user_map.insert(order.id, order_rc.clone());
+
+        // 根据订单类型(买/卖)将订单添加到相应的订单队列中
         if order.side == OrderSide::ASK {
+            // 卖单:添加到卖单队列(asks)
             let key = order.get_ask_key();
-            debug_assert!(!self.asks.contains_key(&key));
+            debug_assert!(!self.asks.contains_key(&key)); // 确保卖单队列中不存在该订单
             self.asks.insert(key, order_rc.clone());
         } else {
+            // 买单:添加到买单队列(bids)
             let key = order.get_bid_key();
-            debug_assert!(!self.bids.contains_key(&key));
+            debug_assert!(!self.bids.contains_key(&key)); // 确保买单队列中不存在该订单
             self.bids.insert(key, order_rc.clone());
         }
+
+        // 返回订单的深拷贝
         order_rc.deep()
     }
 
-    // 完成订单处理
+    // 完成订单处理函数
+    // 当订单完全成交或被取消时调用此函数来清理订单相关的数据结构
     fn order_finish(&mut self, balance_manager: &mut BalanceManagerWrapper<'_>, persistor: &mut impl PersistExector, order: &Order) {
+        // 根据订单类型(买/卖)从相应的订单簿中移除订单
         if order.side == OrderSide::ASK {
+            // 如果是卖单,从卖单队列中移除
             let key = &order.get_ask_key();
-            debug_assert!(self.asks.contains_key(key));
+            debug_assert!(self.asks.contains_key(key)); // 确保订单存在于卖单队列中
             self.asks.remove(key);
         } else {
+            // 如果是买单,从买单队列中移除
             let key = &order.get_bid_key();
-            debug_assert!(self.bids.contains_key(key));
+            debug_assert!(self.bids.contains_key(key)); // 确保订单存在于买单队列中
             self.bids.remove(key);
         }
+
+        // 解冻与订单相关的用户余额
         self.unfrozen_balance(balance_manager, order);
-        debug_assert!(self.orders.contains_key(&order.id));
-        // log::debug!("order finish {}", &order.id);
+
+        // 从全局订单映射中移除订单
+        debug_assert!(self.orders.contains_key(&order.id)); // 确保订单存在于全局订单映射中
         self.orders.remove(&order.id);
+
+        // 从用户订单映射中移除订单
         let user_map = self.users.get_mut(&order.user).unwrap();
-        debug_assert!(user_map.contains_key(&order.id));
+        debug_assert!(user_map.contains_key(&order.id)); // 确保订单存在于用户订单映射中
         user_map.remove(&order.id);
 
+        // 持久化订单完成事件
         persistor.put_order(order, OrderEventType::FINISH);
     }
 
