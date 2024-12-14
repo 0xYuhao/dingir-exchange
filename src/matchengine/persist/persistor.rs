@@ -8,6 +8,7 @@ use crate::types::OrderEventType;
 
 // TODO: fix methods, use ref or value?
 pub trait PersistExector: Send + Sync {
+    // 检查服务是否可用
     fn service_available(&self) -> bool {
         true
     }
@@ -17,15 +18,37 @@ pub trait PersistExector: Send + Sync {
     fn real_persist(&self) -> bool {
         true
     }
+
+    // 持久化余额变更记录
     fn put_balance(&mut self, balance: &BalanceHistory);
+    // 持久化充值记录
     fn put_deposit(&mut self, balance: &BalanceHistory);
+    // 持久化提现记录
     fn put_withdraw(&mut self, balance: &BalanceHistory);
+    // 持久化内部转账记录
     fn put_transfer(&mut self, tx: InternalTx);
+    // 持久化订单信息
     fn put_order(&mut self, order: &Order, at_step: OrderEventType);
+    // 持久化交易记录
     fn put_trade(&mut self, trade: &Trade);
+    // 注册用户信息
     fn register_user(&mut self, user: AccountDesc);
 }
+// 代码实现了几种不同的持久化执行器:
 
+// 1. DummyPersistor - 空实现,不做任何持久化操作
+// 2. MemBasedPersistor - 基于内存的持久化,将数据保存在内存中的messages向量里
+// 3. FileBasedPersistor - 基于文件的持久化,将数据以JSON格式写入文件
+// 4. MessengerBasedPersistor - 基于消息的持久化,通过MessageManager发送消息
+// 5. DBBasedPersistor - 基于数据库的持久化,通过HistoryWriter写入数据库
+// 6. CompositePersistor - 组合持久化器,可以同时使用多个持久化器
+
+// 主要功能:
+// 1. 提供统一的持久化接口
+// 2. 支持多种持久化方式
+// 3. 可以灵活组合使用不同的持久化方式
+// 4. 处理订单、交易、余额等各类数据的持久化
+// 5. 支持同步和异步的持久化操作
 impl PersistExector for Box<dyn PersistExector + '_> {
     fn service_available(&self) -> bool {
         self.as_ref().service_available()
